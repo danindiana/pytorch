@@ -12,65 +12,100 @@ import math
 
 # +++ Self-contained GradBank Definition +++
 class GradBank(torch.nn.Module):
-    """GradBank that applies deterministic gradient manipulation."""
+    """GradBank that applies variance-reducing gradient stabilization."""
     def __init__(self, layer):
         super().__init__()
         self.layer = layer
+        self.bank_len, self.warmup = 128, 10
+        self.register_buffer('bank', torch.zeros(self.bank_len, dtype=torch.float32))
+        self.register_buffer('ptr', torch.zeros((), dtype=torch.long))
+        self.step = 0
+        
+        # Store parameter references for this layer
         self.parameters = list(layer.parameters())
-
-    @torch.no_grad()
-    def apply_manipulation(self, step):
-        """Apply deterministic gradient manipulation based on global step."""
-        if len(self.parameters) == 0:
-            return
-
-        # Deterministic scaling based on global step
-        if step % 3 == 0:
-            scale = 10.0
-            print(f"    🔥 GRADIENT AMPLIFICATION: step={step}, scale={scale}")
-        elif step % 3 == 1:
-            scale = 0.1
-            print(f"    ❄️ GRADIENT REDUCTION: step={step}, scale={scale}")
-        else:
-            scale = 1.0
-            print(f"    ✅ GRADIENT UNCHANGED: step={step}, scale={scale}")
-
-        # Apply the deterministic scaling
-        for p in self.parameters:
-            if p.grad is not None:
-                p.grad.mul_(scale)
-
+        
+        # Variance reduction parameters
+        self.stability_factor = 0.8  # How much to reduce variance
+        self.min_scale = 0.7         # Minimum scaling factor
+        self.max_scale = 1.3         # Maximum scaling factor
+        
+        # Layer state for consistent scaling
+        self.current_scale = 1.0
+        self.scale_update_counter = 0
+        
+        # Register tensor hooks on each parameter
+        self.handles = []
+        for param in self.parameters:
+            if param.requires_grad:
+                handle = param.register_hook(self._make_tensor_hook())
+                self.handles.append(handle)
+    
+    def _update_layer_scale(self, grad_norm):
+        """Update the layer-wide scaling factor for variance reduction."""
+        # Store in bank for history
+        self.bank[self.ptr] = grad_norm
+        self.ptr = (self.ptr + 1) % self.bank_len
+        
+        # Apply variance reduction if past warmup
+        if self.step >= self.warmup:
+            # Get recent gradient norms
+            recent_norms = self.bank[:min(self.step, self.bank_len)].float()
+            
+            if recent_norms.numel() > 0:
+                # Calculate statistics
+                running_median = recent_norms.median().item()
+                running_std = recent_norms.std().item()
+                current_norm = grad_norm
+                
+                # Calculate deviation from median
+                if running_std > 1e-8:
+                    deviation = (current_norm - running_median) / running_std
+                else:
+                    deviation = 0.0
+                
+                # Apply variance reduction: pull gradients toward median
+                adjustment = 1.0 - self.stability_factor * deviation
+                
+                # Clamp to safe bounds
+                new_scale = max(self.min_scale, min(self.max_scale, adjustment))
+                
+                # Apply smoothing for stability
+                self.current_scale = 0.8 * self.current_scale + 0.2 * new_scale
+                
+                # Debug output
+                if self.step % 10 == 0:
+                    print(f"    GradBank: step={self.step}, norm={current_norm:.6f}, "
+                          f"median={running_median:.6f}, std={running_std:.6f}, "
+                          f"deviation={deviation:.3f}, scale={self.current_scale:.6f}")
+        
+        self.step += 1
+    
+    def _make_tensor_hook(self):
+        """Create a tensor hook that applies variance-reducing scaling."""
+        def tensor_hook(grad):
+            """Hook that applies variance-reducing scaling to gradient."""
+            with torch.no_grad():
+                # Calculate gradient norm
+                grad_norm = grad.flatten().norm(2).item()
+                
+                # Update layer scale (only for first parameter to avoid duplicate updates)
+                if self.scale_update_counter == 0:
+                    self._update_layer_scale(grad_norm)
+                
+                self.scale_update_counter = (self.scale_update_counter + 1) % len(self.parameters)
+                
+                # Apply the variance-reducing scaling
+                return grad * self.current_scale
+        
+        return tensor_hook
+    
     def forward(self, *args, **kwargs):
         return self.layer(*args, **kwargs)
-
-class GradBankOptimizer:
-    """Wrapper that applies GradBank manipulation before optimizer step."""
-    def __init__(self, optimizer, model):
-        self.optimizer = optimizer
-        self.gradbank_layers = []
-        self.step_counter = 0
-
-        # Collect all GradBank layers
-        for module in model.modules():
-            if isinstance(module, GradBank):
-                self.gradbank_layers.append(module)
-
-    def step(self):
-        """Apply GradBank manipulation then optimizer step."""
-        for layer in self.gradbank_layers:
-            layer.apply_manipulation(self.step_counter)
-
-        # Call original optimizer
-        self.optimizer.step()
-        self.step_counter += 1
-
-    def zero_grad(self):
-        self.optimizer.zero_grad()
-
-    def __getattr__(self, name):
-        # Delegate all other calls to the optimizer
-        return getattr(self.optimizer, name)
-
+    
+    def __del__(self):
+        # Clean up the hooks
+        for handle in self.handles:
+            handle.remove()
 # --- End of Self-contained Definition ---
 
 SEED = 42
@@ -85,23 +120,21 @@ def verify_determinism():
     parent = torch.nn.Sequential(torch.nn.Linear(512, 512))
     parent[0] = GradBank(parent[0])
     layer = parent.to(DEV)
-
+    
     torch.manual_seed(SEED)
     x = torch.randn(BATCH, 512, device=DEV)
     layer(x).sum().backward()
-    parent[0].apply_manipulation(0)  # Use deterministic step 0
     g1 = parent[0].layer.weight.grad.clone()
     layer.zero_grad()
     torch.manual_seed(SEED)
     layer(x).sum().backward()
-    parent[0].apply_manipulation(0)  # Use deterministic step 0
     g2 = parent[0].layer.weight.grad.clone()
     assert torch.equal(g1, g2), "GradBank not deterministic"
     with open("determinism.log", "w") as f:
         f.write("✅ deterministic\n")
 
 def verify_memory():
-    bank_bytes = 4 * 1024 * 2  # 4 stats, 1024 slots, FP16
+    bank_bytes = 128 * 4  # 128 slots, FP32
     assert bank_bytes < 1_000_000, "RAM claim violated"
     with open("determinism.log", "a") as f:
         f.write(f"✅ RAM = {bank_bytes} bytes < 1 MB\n")
@@ -110,7 +143,7 @@ def verify_memory():
 class Meter:
     def __init__(self):
         self.grad_norms, self.losses, self.steps = [], [], 0
-
+    
     def record_grad_norms(self, model):
         norms = []
         for p in model.parameters():
@@ -126,18 +159,14 @@ def robust_stdev(data):
         return 0.0
     return statistics.stdev(finite_data)
 
-def run(model, x, y, loss_fn, steps=EPOCHS * 50, use_gradbank=False):
+def run(model, x, y, loss_fn, steps=EPOCHS * 50):
     meter = Meter()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    
-    # Wrap optimizer with GradBank if needed
-    if use_gradbank:
-        opt = GradBankOptimizer(opt, model)
-    
     model.train()
     for i in range(steps):
         opt.zero_grad()
         out = model(x)
+        
         if y is not None:
             loss = loss_fn(out, y)
         else:
@@ -181,11 +210,11 @@ def deep_mlp():
     y = torch.randint(0, 512, (BATCH,), device=DEV)
     return net, x, y, torch.nn.functional.cross_entropy
 
-# Robust recursive function to wrap layers
 def wrap_model_layers(model):
     """Recursively wraps all Linear and Conv2d layers in a model."""
     for name, module in list(model.named_children()):
         wrap_model_layers(module)
+        
         if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
             print(f"  Wrapping layer: {name} of type {type(module).__name__}")
             wrapped_layer = GradBank(module)
@@ -210,15 +239,15 @@ for name, task_fn in TASKS:
     net_raw, x, y, loss_fn_raw = task_fn()
     if net_raw is None:
         continue
-
+    
     print("\n[Baseline Run]")
-    meter_raw = run(net_raw, x, y, loss_fn_raw, use_gradbank=False)
+    meter_raw = run(net_raw, x, y, loss_fn_raw)
     torch.manual_seed(SEED)
     net_gb, x, y, loss_fn_gb = task_fn()
-
+    
     print("\n[GradBank Run]")
     wrap_model_layers(net_gb)
-    meter_gb = run(net_gb, x, y, loss_fn_gb, use_gradbank=True)
+    meter_gb = run(net_gb, x, y, loss_fn_gb)
     results.append({
         "task": name,
         "baseline_sigma": robust_stdev(meter_raw.grad_norms),
